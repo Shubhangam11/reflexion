@@ -20,6 +20,45 @@ from prompts import cot_agent_prompt, cot_reflect_agent_prompt, cot_reflect_prom
 from fewshots import WEBTHINK_SIMPLE6, REFLECTIONS, COT, COT_REFLECT
 
 
+try:
+    from prompts import CORRECTION_HEADER, dialogue_correction_prompt, dc_3line_prompt, safe_revision_prompt
+except Exception:
+    CORRECTION_HEADER = "\n\nCORRECTION MEMORY (avoid repeating these mistakes):\n"
+    dialogue_correction_prompt = PromptTemplate(
+        input_variables=["question", "scratchpad"],
+        template=(
+            "You are reviewing an agent reasoning trace.\n"
+            "Return EXACTLY 4 lines:\n\n"
+            "Risky claim: <specific unsupported assertion OR NONE>\n"
+            "Problem: <unsupported / contradiction / overconfident OR NONE>\n"
+            "Correction: <safer formulation>\n"
+            "Future guidance: <one instruction for next attempt>\n\n"
+            "Question: {question}\n\nTrajectory:\n{scratchpad}\n"
+        ),
+    )
+    dc_3line_prompt = PromptTemplate(
+        input_variables=["question", "scratchpad"],
+        template=(
+            "You are reviewing an agent reasoning trace.\n"
+            "Return EXACTLY 3 lines:\n\n"
+            "Risky claim: <specific unsupported assertion OR NONE>\n"
+            "Problem: <unsupported / wrong-source / search-loop / overconfident OR NONE>\n"
+            "Future guidance: <one instruction for next attempt>\n\n"
+            "If the agent answer was correct, return NONE for all fields.\n\n"
+            "Question: {question}\n\nTrajectory:\n{scratchpad}\n"
+        ),
+    )
+    safe_revision_prompt = PromptTemplate(
+        input_variables=["original", "revised"],
+        template=(
+            "Original answer: {original}\n"
+            "Revised answer:  {revised}\n\n"
+            "Is the revised answer clearly more accurate than the original?\n"
+            "Reply with exactly one word: YES or NO."
+        ),
+    )
+
+
 class ReflexionStrategy(Enum):
     """
     NONE: No reflection
@@ -31,6 +70,30 @@ class ReflexionStrategy(Enum):
     LAST_ATTEMPT = 'last_trial' 
     REFLEXION = 'reflexion'
     LAST_ATTEMPT_AND_REFLEXION = 'last_trial_and_reflexion'
+    DIALOGUE_CORRECTION        = 'dialogue_correction'        # full 4-line (multi-turn)
+    DIALOGUE_CORRECTION_3LINE  = 'dialogue_correction_3l'     # 3-line no Correction (multi-trial)
+    REFLEXION_FILTERED         = 'reflexion_filtered'         # pivot 1
+    DC_3LINE_FILTERED          = 'dc_3line_filtered'          # pivot 1
+    SAFE_DC_3LINE              = 'safe_dc_3line'              # pivot 2
+
+
+def is_useful_reflection(note: str) -> bool:
+    if not note or not note.strip():
+        return False
+    lines = [l.strip().lower() for l in note.strip().splitlines() if l.strip()]
+    non_none = [l for l in lines
+                if 'none' not in l.split(':', 1)[-1].strip().lower()]
+    if len(non_none) == 0:
+        return False
+    content = re.sub(r'(risky claim|problem|correction|future guidance)\s*:', '',
+                     note, flags=re.IGNORECASE)
+    if len(content.replace(' ', '').replace('\n', '')) < 15:
+        return False
+    return True
+
+
+def is_duplicate_reflection(note: str, existing) -> bool:
+    return note.strip() in [e.strip() for e in existing]
 
 
 class CoTAgent:
@@ -88,7 +151,11 @@ class CoTAgent:
         self.scratchpad += f'\nAction:'
         action = self.prompt_agent()
         self.scratchpad += ' ' + action
-        action_type, argument = parse_action(action)
+        parsed = parse_action(action)
+        if parsed is None:
+            action_type, argument = 'Invalid', action
+        else:
+            action_type, argument = parsed
         print(self.scratchpad.split('\n')[-1])  
 
         self.scratchpad += f'\nObservation: '
@@ -198,7 +265,11 @@ class ReactAgent:
         self.scratchpad += f'\nAction {self.step_n}:'
         action = self.prompt_agent()
         self.scratchpad += ' ' + action
-        action_type, argument = parse_action(action)
+        parsed = parse_action(action)
+        if parsed is None:
+            action_type, argument = 'Invalid', action
+        else:
+            action_type, argument = parsed
         print(self.scratchpad.split('\n')[-1])
 
         # Observe
@@ -288,8 +359,13 @@ class ReactReflectAgent(ReactAgent):
         self.reflect_examples = REFLECTIONS
         self.reflections: List[str] = []
         self.reflections_str: str = ''
+        self.correction_memory: List[str] = []
+        self.correction_memory_str: str = ""
+        self.max_corrections: int = 3
+        self._prev_answer: str = ''
     
     def run(self, reset = True, reflect_strategy: ReflexionStrategy = ReflexionStrategy.REFLEXION) -> None:
+        self._prev_answer = self.answer
         if (self.is_finished() or self.is_halted()) and not self.is_correct():
             self.reflect(reflect_strategy)
 
@@ -308,12 +384,66 @@ class ReactReflectAgent(ReactAgent):
             self.reflections_str = format_last_attempt(self.question, self.scratchpad)
             self.reflections = [self.prompt_reflection()]
             self.reflections_str += format_reflections(self.reflections, header = REFLECTION_AFTER_LAST_TRIAL_HEADER)
+        elif strategy == ReflexionStrategy.DIALOGUE_CORRECTION:
+            corr = self.prompt_dialogue_correction()
+            self.correction_memory.append(corr)
+            self.correction_memory = self.correction_memory[-self.max_corrections:]
+            self.correction_memory_str = format_corrections(self.correction_memory)
+        elif strategy == ReflexionStrategy.DIALOGUE_CORRECTION_3LINE:
+            corr = self.prompt_dialogue_correction_3line()
+            self.correction_memory.append(corr)
+            self.correction_memory = self.correction_memory[-self.max_corrections:]
+            self.correction_memory_str = format_corrections(self.correction_memory)
+        elif strategy == ReflexionStrategy.REFLEXION_FILTERED:
+            note = self.prompt_reflection()
+            if is_useful_reflection(note) and not is_duplicate_reflection(note, self.reflections):
+                self.reflections.append(note)
+            self.reflections_str = format_reflections(self.reflections)
+        elif strategy == ReflexionStrategy.DC_3LINE_FILTERED:
+            note = self.prompt_dialogue_correction_3line()
+            if is_useful_reflection(note) and not is_duplicate_reflection(note, self.correction_memory):
+                self.correction_memory.append(note)
+                self.correction_memory = self.correction_memory[-self.max_corrections:]
+            self.correction_memory_str = format_corrections(self.correction_memory)
+        elif strategy == ReflexionStrategy.SAFE_DC_3LINE:
+            note = self.prompt_dialogue_correction_3line()
+            if is_useful_reflection(note) and not is_duplicate_reflection(note, self.correction_memory):
+                self.correction_memory.append(note)
+                self.correction_memory = self.correction_memory[-self.max_corrections:]
+            self.correction_memory_str = format_corrections(self.correction_memory)
+            # trial-level revision gate
+            if self.answer and self._prev_answer and self.answer != self._prev_answer:
+                gate = self.prompt_revision_gate(self._prev_answer, self.answer)
+                if gate.strip().upper().startswith('NO'):
+                    self.answer = self._prev_answer
         else:
             raise NotImplementedError(f'Unknown reflection strategy: {strategy}')
         print(self.reflections_str)
+        if self.correction_memory_str:
+            print(self.correction_memory_str)
     
     def prompt_reflection(self) -> str:
         return format_step(self.reflect_llm(self._build_reflection_prompt()))
+
+    def prompt_dialogue_correction(self) -> str:
+        return self.reflect_llm(self._build_dialogue_correction_prompt()).strip()
+
+    def _build_dialogue_correction_prompt(self) -> str:
+        return dialogue_correction_prompt.format(
+            question=self.question,
+            scratchpad=truncate_scratchpad(self.scratchpad, tokenizer=self.enc))
+
+    def prompt_dialogue_correction_3line(self) -> str:
+        return self.reflect_llm(self._build_dc_3line_prompt()).strip()
+
+    def _build_dc_3line_prompt(self) -> str:
+        return dc_3line_prompt.format(
+            question=self.question,
+            scratchpad=truncate_scratchpad(self.scratchpad, tokenizer=self.enc))
+
+    def prompt_revision_gate(self, original: str, revised: str) -> str:
+        prompt = safe_revision_prompt.format(original=original, revised=revised)
+        return self.reflect_llm(prompt).strip()
 
 
     def _build_reflection_prompt(self) -> str:
@@ -323,9 +453,10 @@ class ReactReflectAgent(ReactAgent):
                             scratchpad = truncate_scratchpad(self.scratchpad, tokenizer=self.enc))
  
     def _build_agent_prompt(self) -> str:
+        combined = (self.correction_memory_str + "\n" + self.reflections_str).strip() if self.correction_memory_str else self.reflections_str
         return self.agent_prompt.format(
                             examples = self.react_examples,
-                            reflections = self.reflections_str,
+                            reflections = combined,
                             question = self.question,
                             scratchpad = self.scratchpad)
    
@@ -359,6 +490,11 @@ def format_last_attempt(question: str,
                         scratchpad: str,
                         header: str = LAST_TRIAL_HEADER):
     return header + f'Question: {question}\n' + truncate_scratchpad(scratchpad, tokenizer=gpt2_enc).strip('\n').strip() + '\n(END PREVIOUS TRIAL)\n'
+
+def format_corrections(corrections, header: str = CORRECTION_HEADER) -> str:
+    if not corrections:
+        return ""
+    return header + "\n".join([f"- {c.strip()}" for c in corrections])
 
 def truncate_scratchpad(scratchpad: str, n_tokens: int = 1600, tokenizer = gpt2_enc) -> str:
     lines = scratchpad.split('\n')

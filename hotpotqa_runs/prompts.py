@@ -140,3 +140,56 @@ reflect_prompt = PromptTemplate(
 
 
 
+CORRECTION_HEADER = "\n\nCORRECTION MEMORY (avoid repeating these mistakes):\n"
+
+DIALOGUE_CORRECTION_INSTRUCTION = """You are reviewing an agent reasoning trace.
+Return EXACTLY 4 lines in this format:
+
+Risky claim: <one unsupported or questionable claim OR NONE>
+Problem: <unsupported / contradiction / overconfident OR NONE>
+Correction: <safer corrected statement or uncertainty phrasing>
+Future guidance: <one sentence instruction for the next attempt>
+
+Question: {question}
+
+Trajectory:
+{scratchpad}
+"""
+
+dialogue_correction_prompt = PromptTemplate(
+    input_variables=["question", "scratchpad"],
+    template=DIALOGUE_CORRECTION_INSTRUCTION,
+)
+
+DC_3LINE_INSTRUCTION = """You are reviewing an agent reasoning trace.
+Return EXACTLY 3 lines in this format:
+
+Risky claim: <one unsupported or questionable claim OR NONE>
+Problem: <unsupported / wrong-source / search-loop / overconfident OR NONE>
+Future guidance: <one sentence instruction for the next attempt>
+
+If the agent answer was correct, return NONE for all three fields.
+
+Question: {question}
+
+Trajectory:
+{scratchpad}
+"""
+
+dc_3line_prompt = PromptTemplate(
+    input_variables=["question", "scratchpad"],
+    template=DC_3LINE_INSTRUCTION,
+)
+
+SAFE_REVISION_INSTRUCTION = """You are a strict verifier.
+Original answer: {original}
+Revised answer:  {revised}
+
+Is the revised answer clearly more accurate than the original?
+Reply with exactly one word: YES or NO."""
+
+safe_revision_prompt = PromptTemplate(
+    input_variables=["original", "revised"],
+    template=SAFE_REVISION_INSTRUCTION,
+)
+
